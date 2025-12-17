@@ -1,0 +1,142 @@
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+from ast import literal_eval  # [중요] 문자열을 리스트로 변환하는 도구
+from gensim.models import Word2Vec
+import logging
+import os
+
+# ---------------------------------------------------------
+# 1. 데이터 로드 및 전처리
+# ---------------------------------------------------------
+# 경로 설정 (실제 경로 확인)
+ngram_path = r'C:\TMD_Project\master_ngram_dictionary.csv'
+df_path = r'C:\TMD_Project\df_master_TM_proj_lemma.csv'
+
+print("데이터 로딩 중...")
+ngram_df = pd.read_csv(ngram_path)
+df = pd.read_csv(df_path)
+
+# [중요] CSV에서 불러온 '텍스트 리스트' 컬럼을 진짜 리스트로 변환
+# 데이터가 "['단어', '단어']" 형태의 문자열로 되어있다고 가정합니다.
+print("데이터 타입 변환 중 (String -> List)...")
+try:
+    # 만약 데이터가 이미 공백으로 구분된 문자열("금리 인상 논의")이라면 이 단계는 건너뛰거나 에러가 날 수 있음
+    # 안전하게 처리하기 위해 샘플 확인 후 적용
+    sample = df['cleaned_text_lemma'].iloc[0]
+    if isinstance(sample, str) and sample.startswith('[') and sample.endswith(']'):
+        df['cleaned_text_lemma'] = df['cleaned_text_lemma'].apply(literal_eval)
+except Exception as e:
+    print(f"⚠️ 리스트 변환 중 에러 발생 (또는 이미 리스트 형식이 아님): {e}")
+    # 에러가 나면 그냥 진행 (데이터가 공백 구분 텍스트일 수도 있으므로)
+
+# 결측치 제거
+df = df.dropna(subset=['cleaned_text_lemma'])
+
+# ---------------------------------------------------------
+# 2. 치환 패턴 생성 (긴 단어 우선)
+# ---------------------------------------------------------
+# ';' 처리 및 길이 계산
+ngram_df['ngram_pattern'] = ngram_df['ngram'].str.replace(';', ' ')
+ngram_df['length'] = ngram_df['ngram_pattern'].apply(lambda x: len(str(x).split()))
+
+# 정렬: 길이 긴 순 -> 점수 높은 순
+sorted_ngrams = ngram_df.sort_values(by=['length', 'score'], ascending=[False, False])
+
+replacement_list = []
+for idx, row in sorted_ngrams.iterrows():
+    pattern = row['ngram_pattern']
+    replacement = pattern.replace(" ", "_")
+    replacement_list.append((pattern, replacement))
+
+print(f"치환 패턴 준비 완료: {len(replacement_list)}개")
+
+
+# ---------------------------------------------------------
+# 3. 치환 함수 정의
+# ---------------------------------------------------------
+def apply_ngram_replacement(token_input, replace_patterns):
+    # 1. 입력값이 리스트인 경우 공백 문자열로 변환
+    if isinstance(token_input, list):
+        text = " ".join(token_input)
+    elif isinstance(token_input, str):
+        text = token_input
+    else:
+        return []  # NaN이나 숫자인 경우 빈 리스트 반환
+
+    # 2. 치환 수행
+    for pattern, replacement in replace_patterns:
+        if pattern in text:
+            text = text.replace(pattern, replacement)
+
+    # 3. 결과 반환 (다시 리스트로)
+    return text.split()
+
+
+# ---------------------------------------------------------
+# 4. 실행 (치환 적용)
+# ---------------------------------------------------------
+tqdm.pandas()
+print("N-gram 치환 시작... (데이터 크기에 따라 시간이 소요됩니다)")
+
+df['ngram_text_lemma'] = df['cleaned_text_lemma'].progress_apply(
+    lambda x: apply_ngram_replacement(x, replacement_list)
+)
+
+# 결과 샘플 확인
+print("\n[샘플 확인]")
+print(f"원본: {df['cleaned_text_lemma'].iloc[0]}")
+print(f"치환: {df['ngram_text_lemma'].iloc[0]}")
+
+# ---------------------------------------------------------
+# 5. 저장 (중간 결과)
+# ---------------------------------------------------------
+df.to_pickle(r"C:\TMD_Project\corpus_with_ngrams.pkl")
+print("중간 데이터 저장 완료 (pickle)")
+
+# ---------------------------------------------------------
+# 6. Word2Vec 학습
+# ---------------------------------------------------------
+logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+
+sentences = df['ngram_text_lemma'].tolist()
+print(f"Word2Vec 학습 시작 (문장 수: {len(sentences):,})")
+
+model = Word2Vec(
+    sentences=sentences,
+    vector_size=100,
+    window=5,
+    min_count=10,  # 데이터가 적으면 5로 낮추는 것도 고려
+    workers=4,
+    sg=1,  # Skip-gram (필수)
+    epochs=10,
+    seed=42
+)
+
+# 모델 저장
+model.save(r"C:\TMD_Project\ngram_col_word2vec.model")
+print("✅ 모델 학습 및 저장 완료!")
+
+
+# ---------------------------------------------------------
+# 7. 검증
+# ---------------------------------------------------------
+def check_similarity(word):
+    try:
+        similar_words = model.wv.most_similar(word, topn=10)
+        print(f"\n🔹 '{word}'와 가장 유사한 표현 TOP 10:")
+        for w, sim in similar_words:
+            print(f"  - {w} ({sim:.4f})")
+    except KeyError:
+        print(f"\n⚠️ '{word}'는 단어 사전에 없습니다. (빈도수 부족 등)")
+
+
+# 테스트
+check_similarity("rate_hike")         # 금리 인상
+check_similarity("price_stability")   # 물가 안정
+check_similarity("monetary_policy")   # 통화 정책
+
+# 2. 일반 주요 단어 확인 (Unigrams)
+check_similarity("inflation")         # 인플레이션
+check_similarity("liquidity")         # 유동성
+check_similarity("recession")         # 경기 침체
