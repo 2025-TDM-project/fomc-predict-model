@@ -62,7 +62,7 @@ def filter_by_collocation(text, collocation_set):
 # ==========================================
 # 5. 메인 실행 흐름 (매개변수 추가)
 # ==========================================
-def main(target_col='cleaned_text'): # 분석하고 싶은 컬럼명을 인자로 받음
+def main(target_col='cleaned_text_lemma'): # 분석하고 싶은 컬럼명을 인자로 받음
     print(f"--- TF-IDF Analysis for Column: {target_col} ---")
     
     print("1. Loading Documents...")
