@@ -1,124 +1,287 @@
-#DataLoad
 import pandas as pd
-
-bond_path='/content/bond_report_master.csv'
-news_path='/content/news_posclean_dirty.csv'
-fomc_path='/content/FOMC_full_sentence_level_with_sections_3.csv'
-
-df_bond=pd.read_csv(bond_path, usecols=['doc_id','cleaned_text'])
-df_news=pd.read_csv(news_path, usecols=['doc_id','cleaned_text'])
-df_fomc=pd.read_csv(fomc_path, usecols=['doc_id','cleaned_text'])
-
-df=pd.concat([df_bond, df_news, df_fomc],axis=0)
-
-df_5_gram=pd.read_csv('/content/fivegram_collocations.csv')
-df_2_gram=pd.read_csv('/content/bigram_collocations.csv')
-df_3_gram=pd.read_csv('/content/trigram_collocations.csv')
-df_4_gram=pd.read_csv('/content/fourgram_collocations.csv')
-df_n_gram=pd.concat([df_2_gram, df_3_gram, df_4_gram, df_5_gram])
-
-#freq 15 이상만 남기기(논문 기준)
-df_n_gram_freq15=df_n_gram[df_n_gram['freq']>=15]
-
-#문서 재구성 (doc_id 기준 'cleaned_text' 연결)
-df['cleaned_text'] = df['cleaned_text'].fillna('')
-df_sum = df.groupby('doc_id')['cleaned_text'].agg(lambda x: ' '.join(x)).reset_index()
-df_sum.rename(columns={'cleaned_text': 'full_document'}, inplace=True)
-df_sum['full_document'] = df_sum['full_document'].apply(lambda x: ', '.join(set(x.split())))
-
-#distilling by collocation
-collocation_text = df_n_gram_freq15['ngram'].apply(lambda x: ', '.join(set(x.split())))
-collocation_text=collocation_text.to_list()
-
-#연어 모음 불러오기
+import numpy as np
 import pickle
-
-file_path='/content/collocation_list.pkl'
-# 'rb': 읽기 모드 (Read Binary)
-with open(file_path, 'rb') as f:
-    collocation_text_list = pickle.load(f)
-collocation_set = set(collocation_text_list)
-
-def collocation_words(col):
-    words = str(col).split(', ')
-    return ' '.join([word for word in words if word in collocation_set])
-
-df_sum['distilled_by_collocation']=df_sum['lemmatized_text'].apply(collocation_words)
-
-df_sum['distilled_by_collocation']=df_sum['lemmatized_text'].apply(collocation_words)
-
-
-#TF-IDF
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-# 2. TfidfVectorizer 적용
-vectorizer = TfidfVectorizer()
-tfidf_matrix = vectorizer.fit_transform(df_sum['distilled_by_collocation'])
-# tfidf_matrix = vectorizer.fit_transform(df_sum['cleaned_text'])
+# ==========================================
+# 1. 설정 및 경로 (Configuration)
+# ==========================================
+PATHS = {
+    'bond': '/content/bond_report_master.csv',
+    'news': '/content/news_posclean_dirty.csv',
+    'fomc': '/content/FOMC_full_sentence_level_with_sections_3.csv',
+    'collocation_pickle': '/content/collocation_list.pkl',
+    'n_grams': [
+        '/content/bigram_collocations.csv',
+        '/content/trigram_collocations.csv',
+        '/content/fourgram_collocations.csv',
+        '/content/fivegram_collocations.csv'
+    ],
+    'output': 'df_master_TM_proj.csv'
+}
 
-feature_names = vectorizer.get_feature_names_out()
+# ==========================================
+# 2. 데이터 로드 및 병합 (Data Loading)
+# ==========================================
+def load_and_merge_documents():
+    """본문 데이터(Bond, News, FOMC)를 로드하고 하나로 병합합니다."""
+    cols = ['doc_id', 'cleaned_text']
+    
+    df_bond = pd.read_csv(PATHS['bond'], usecols=cols)
+    df_news = pd.read_csv(PATHS['news'], usecols=cols)
+    df_fomc = pd.read_csv(PATHS['fomc'], usecols=cols)
 
-# 3. TF-IDF over Threshold per Doc
-import numpy as np
+    df_merged = pd.concat([df_bond, df_news, df_fomc], axis=0, ignore_index=True)
+    df_merged['cleaned_text'] = df_merged['cleaned_text'].fillna('')
+    
+    return df_merged
 
-def extract_filtered_keywords(doc_index, tfidf_matrix, feature_names, min_score=0.5):
-    # doc_index가 행렬 범위를 벗어나지 않는지 방어 코드 (선택 사항)
-    if doc_index >= tfidf_matrix.shape[0]:
-        return ""
+def load_collocation_set():
+    """Pickle 파일에서 연어(Collocation) 리스트를 로드하여 set으로 반환합니다."""
+    # (참고) N-gram CSV 로드 로직이 원본에 있었으나, 
+    # 실제 필터링에는 pickle 파일이 사용되므로 pickle 로드만 수행합니다.
+    with open(PATHS['collocation_pickle'], 'rb') as f:
+        collocation_text_list = pickle.load(f)
+    return set(collocation_text_list)
 
-    # 해당 문서의 점수 추출
-    vector = tfidf_matrix.getrow(doc_index).toarray().flatten()
+# ==========================================
+# 3. 텍스트 전처리 (Preprocessing)
+# ==========================================
+def preprocess_documents(df):
+    """문서를 doc_id 기준으로 그룹화하고 텍스트를 재구성합니다."""
+    # doc_id별로 텍스트 합치기
+    df_sum = df.groupby('doc_id')['cleaned_text'].agg(lambda x: ' '.join(x)).reset_index()
+    df_sum.rename(columns={'cleaned_text': 'full_document'}, inplace=True)
+    
+    # 중복 단어 제거 (Set 사용)
+    df_sum['full_document'] = df_sum['full_document'].apply(lambda x: ', '.join(set(x.split())))
+    
+    return df_sum
 
-    # 1. 점수 필터링 (min_score 이상인 것만)
+def filter_by_collocation(text, collocation_set):
+    """텍스트에서 Collocation Set에 포함된 단어만 추출합니다."""
+    words = str(text).split(', ')
+    # 리스트 컴프리헨션으로 필터링
+    filtered_words = [word for word in words if word in collocation_set]
+    return ' '.join(filtered_words)
+
+# ==========================================
+# 4. TF-IDF 분석 (Analysis)
+# ==========================================
+def get_keywords_over_threshold(doc_idx, tfidf_matrix, feature_names, min_score=0.5):
+    """임계값(min_score) 이상의 키워드를 추출합니다."""
+    vector = tfidf_matrix[doc_idx].toarray().flatten()
+    
+    # 임계값 이상인 인덱스 추출
     filtered_indices = np.where(vector >= min_score)[0]
-
-    # 해당되는 단어가 없으면 빈 문자열 반환
+    
     if len(filtered_indices) == 0:
         return ""
+    
+    # 점수 기준 내림차순 정렬
+    sorted_indices = filtered_indices[np.argsort(vector[filtered_indices])[::-1]]
+    
+    result = [f"{feature_names[i]}: {vector[i]:.3f}" for i in sorted_indices]
+    return ', '.join(result)
 
-    # 2. 점수 내림차순 정렬
-    # vector[filtered_indices]로 값만 먼저 뽑고, 그 안에서 argsort를 수행
-    sorted_indices_local = np.argsort(vector[filtered_indices])[::-1]
-    sorted_indices = filtered_indices[sorted_indices_local]
+def get_top_n_keywords(doc_idx, tfidf_matrix, feature_names, top_n=50):
+    """상위 N개의 키워드를 추출합니다."""
+    vector = tfidf_matrix[doc_idx].toarray().flatten()
+    
+    # 상위 N개 인덱스 추출 (내림차순)
+    top_indices = vector.argsort()[-top_n:][::-1]
+    
+    result = [f"{feature_names[i]}: {vector[i]:.3f}" for i in top_indices]
+    return ', '.join(result)
 
-    # 3. 문자열 생성
-    result_list = [
-        f"{feature_names[i]}: {vector[i]:.3f}"
-        for i in sorted_indices
+# ==========================================
+# 5. 메인 실행 흐름 (Main Execution)
+# ==========================================
+def main():
+    print("1. Loading Documents...")
+    df_origin = load_and_merge_documents()
+    
+    print("2. Grouping Documents by ID...")
+    df_sum = preprocess_documents(df_origin)
+    
+    print("3. Loading Collocations & Filtering...")
+    collocation_set = load_collocation_set()
+    
+    # 주의: 원본 코드의 'lemmatized_text'는 존재하지 않아 'full_document'로 대체했습니다.
+    df_sum['distilled_by_collocation'] = df_sum['full_document'].apply(
+        lambda x: filter_by_collocation(x, collocation_set)
+    )
+
+    print("4. Running TF-IDF Vectorizer...")
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(df_sum['distilled_by_collocation'])
+    feature_names = vectorizer.get_feature_names_out()
+
+    print("5. Extracting Keywords...")
+    # (1) Threshold 0.5 이상
+    df_sum['tf_idf_over0.5'] = [
+        get_keywords_over_threshold(i, tfidf_matrix, feature_names, min_score=0.5) 
+        for i in range(len(df_sum))
+    ]
+    
+    # (2) Top 50 키워드
+    df_sum['tf_idf_top50'] = [
+        get_top_n_keywords(i, tfidf_matrix, feature_names, top_n=50) 
+        for i in range(len(df_sum))
     ]
 
-    return ', '.join(result_list)
+    print("6. Merging Results & Saving...")
+    # 필요한 컬럼만 선택하여 병합
+    df_mapping = df_sum[['doc_id', 'tf_idf_over0.5', 'tf_idf_top50', 'distilled_by_collocation']]
+    
+    # 원본 데이터(문장 단위)에 문서 단위 키워드 정보를 매핑
+    df_final = pd.merge(df_origin, df_mapping, on='doc_id', how='left')
+    
+    df_final.to_csv(PATHS['output'], index=False)
+    print(f"Done! File saved to: {PATHS['output']}")
 
-# --- 함수 적용 ---
-df_sum = df_sum.reset_index(drop=True)
+if __name__ == "__main__":
+    main()import pandas as pd
+import numpy as np
+import pickle
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-df_sum['tf_idf_over0.5'] = [
-    extract_filtered_keywords(i, tfidf_matrix, feature_names, min_score=0.5)
-    for i in range(len(df_sum))
-]
+# ==========================================
+# 1. 설정 및 경로 (Configuration)
+# ==========================================
+PATHS = {
+    'bond': '/content/bond_report_master.csv',
+    'news': '/content/news_posclean_dirty.csv',
+    'fomc': '/content/FOMC_full_sentence_level_with_sections_3.csv',
+    'collocation_pickle': '/content/collocation_list.pkl',
+    'n_grams': [
+        '/content/bigram_collocations.csv',
+        '/content/trigram_collocations.csv',
+        '/content/fourgram_collocations.csv',
+        '/content/fivegram_collocations.csv'
+    ],
+    'output': 'df_master_TM_proj.csv'
+}
 
-df_mapping = df_sum[['doc_id', 'tf_idf_over0.5', 'distilled_by_collocation']]
+# ==========================================
+# 2. 데이터 로드 및 병합 (Data Loading)
+# ==========================================
+def load_and_merge_documents():
+    """본문 데이터(Bond, News, FOMC)를 로드하고 하나로 병합합니다."""
+    cols = ['doc_id', 'cleaned_text']
+    
+    df_bond = pd.read_csv(PATHS['bond'], usecols=cols)
+    df_news = pd.read_csv(PATHS['news'], usecols=cols)
+    df_fomc = pd.read_csv(PATHS['fomc'], usecols=cols)
 
-# print(df_mapping.shape)
-# print(df_mapping.head())
+    df_merged = pd.concat([df_bond, df_news, df_fomc], axis=0, ignore_index=True)
+    df_merged['cleaned_text'] = df_merged['cleaned_text'].fillna('')
+    
+    return df_merged
 
-# 3. TF-IDF TOP N Per Doc
-def extract_top_keywords(doc_index, top_n=50):
-    vector = tfidf_matrix.getrow(doc_index).toarray().flatten()
+def load_collocation_set():
+    """Pickle 파일에서 연어(Collocation) 리스트를 로드하여 set으로 반환합니다."""
+    # (참고) N-gram CSV 로드 로직이 원본에 있었으나, 
+    # 실제 필터링에는 pickle 파일이 사용되므로 pickle 로드만 수행합니다.
+    with open(PATHS['collocation_pickle'], 'rb') as f:
+        collocation_text_list = pickle.load(f)
+    return set(collocation_text_list)
+
+# ==========================================
+# 3. 텍스트 전처리 (Preprocessing)
+# ==========================================
+def preprocess_documents(df):
+    """문서를 doc_id 기준으로 그룹화하고 텍스트를 재구성합니다."""
+    # doc_id별로 텍스트 합치기
+    df_sum = df.groupby('doc_id')['cleaned_text'].agg(lambda x: ' '.join(x)).reset_index()
+    df_sum.rename(columns={'cleaned_text': 'full_document'}, inplace=True)
+    
+    # 중복 단어 제거 (Set 사용)
+    df_sum['full_document'] = df_sum['full_document'].apply(lambda x: ', '.join(set(x.split())))
+    
+    return df_sum
+
+def filter_by_collocation(text, collocation_set):
+    """텍스트에서 Collocation Set에 포함된 단어만 추출합니다."""
+    words = str(text).split(', ')
+    # 리스트 컴프리헨션으로 필터링
+    filtered_words = [word for word in words if word in collocation_set]
+    return ' '.join(filtered_words)
+
+# ==========================================
+# 4. TF-IDF 분석 (Analysis)
+# ==========================================
+def get_keywords_over_threshold(doc_idx, tfidf_matrix, feature_names, min_score=0.5):
+    """임계값(min_score) 이상의 키워드를 추출합니다."""
+    vector = tfidf_matrix[doc_idx].toarray().flatten()
+    
+    # 임계값 이상인 인덱스 추출
+    filtered_indices = np.where(vector >= min_score)[0]
+    
+    if len(filtered_indices) == 0:
+        return ""
+    
+    # 점수 기준 내림차순 정렬
+    sorted_indices = filtered_indices[np.argsort(vector[filtered_indices])[::-1]]
+    
+    result = [f"{feature_names[i]}: {vector[i]:.3f}" for i in sorted_indices]
+    return ', '.join(result)
+
+def get_top_n_keywords(doc_idx, tfidf_matrix, feature_names, top_n=50):
+    """상위 N개의 키워드를 추출합니다."""
+    vector = tfidf_matrix[doc_idx].toarray().flatten()
+    
+    # 상위 N개 인덱스 추출 (내림차순)
     top_indices = vector.argsort()[-top_n:][::-1]
+    
+    result = [f"{feature_names[i]}: {vector[i]:.3f}" for i in top_indices]
+    return ', '.join(result)
 
-    # 상위 N개 단어만 리스트로 반환
-    top_words = [f"{feature_names[i]}: {vector[i]:.3f}" for i in top_indices]
-    return ', '.join(top_words)
+# ==========================================
+# 5. 메인 실행 흐름 (Main Execution)
+# ==========================================
+def main():
+    print("1. Loading Documents...")
+    df_origin = load_and_merge_documents()
+    
+    print("2. Grouping Documents by ID...")
+    df_sum = preprocess_documents(df_origin)
+    
+    print("3. Loading Collocations & Filtering...")
+    collocation_set = load_collocation_set()
+    
+    # 주의: 원본 코드의 'lemmatized_text'는 존재하지 않아 'full_document'로 대체했습니다.
+    df_sum['distilled_by_collocation'] = df_sum['full_document'].apply(
+        lambda x: filter_by_collocation(x, collocation_set)
+    )
 
-# 4. df_sum에 'top_keywords' 컬럼 추가
-df_mapping['tf_idf_top50'] = [extract_top_keywords(i) for i in range(len(df_mapping))]
+    print("4. Running TF-IDF Vectorizer...")
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(df_sum['distilled_by_collocation'])
+    feature_names = vectorizer.get_feature_names_out()
 
-# # 5. doc_id를 기준으로 원본 df에 병합 (매핑)
-# # df_sum의 'doc_id'와 'top_keywords'만 필요
-df_mapping = df_mapping[['doc_id', 'tf_idf_over0.5', 'tf_idf_top50', 'distilled_by_collocation']]
+    print("5. Extracting Keywords...")
+    # (1) Threshold 0.5 이상
+    df_sum['tf_idf_over0.5'] = [
+        get_keywords_over_threshold(i, tfidf_matrix, feature_names, min_score=0.5) 
+        for i in range(len(df_sum))
+    ]
+    
+    # (2) Top 50 키워드
+    df_sum['tf_idf_top50'] = [
+        get_top_n_keywords(i, tfidf_matrix, feature_names, top_n=50) 
+        for i in range(len(df_sum))
+    ]
 
-# 'doc_id'가 일치하는 모든 문장(df의 행)에 해당 문서의 top_keywords를 할당
-df = pd.merge(df, df_mapping, on='doc_id', how='left')
+    print("6. Merging Results & Saving...")
+    # 필요한 컬럼만 선택하여 병합
+    df_mapping = df_sum[['doc_id', 'tf_idf_over0.5', 'tf_idf_top50', 'distilled_by_collocation']]
+    
+    # 원본 데이터(문장 단위)에 문서 단위 키워드 정보를 매핑
+    df_final = pd.merge(df_origin, df_mapping, on='doc_id', how='left')
+    
+    df_final.to_csv(PATHS['output'], index=False)
+    print(f"Done! File saved to: {PATHS['output']}")
 
-df.to_csv('df_master_TM_proj.csv', index=False)
+if __name__ == "__main__":
+    main()
