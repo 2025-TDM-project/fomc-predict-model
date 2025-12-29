@@ -49,8 +49,13 @@ Hawkish / Dovish / Neutral
 
 算出結果（アウトプット）
 ·文書単位のタカ派・ハト派スコア
+
 ·文書ラベル（Hawkish / Dovish / Neutral）
+
 ·トピック別サマリーテーブル
+
 ·主要単語（Top Words）
+
 ·平均感情スコア
+
 ·文書数
